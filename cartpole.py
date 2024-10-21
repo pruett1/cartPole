@@ -1,4 +1,5 @@
 import gymnasium as gym
+from gymnasium import wrappers
 import math
 import random
 import matplotlib
@@ -11,10 +12,23 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 
+from time import sleep
+
 import faulthandler
 faulthandler.enable()
 
-env = gym.make("CartPole-v1")
+class CustomReward(gym.Wrapper):
+    def __init__(self, env):
+        super(CustomReward, self).__init__(env)
+    
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+
+        reward = 1 * (1/(1-abs(obs[0]))) - abs(obs[2]) # smaller reward the more the pole deviates from vertical or center
+
+        return obs, reward, terminated, truncated, info
+
+env = CustomReward(gym.make("CartPole-v1", render_mode="human"))
 
 is_ipython = 'inline' in matplotlib.get_backend()
 if is_ipython:
@@ -45,14 +59,16 @@ class DQN(nn.Module):
         super(DQN, self).__init__()
         self.layer1 = nn.Linear(n_observations, 128)
         self.layer2 = nn.Linear(128, 128)
-        self.layer3 = nn.Linear(128, n_actions)
+        self.layer3 = nn.Linear(128, 128)
+        self.layer4 = nn.Linear(128, n_actions)
 
     # Called with either one element to determine next adtions, or a batch during optimization
     # Returns tensor([[left0exp, right0exp], ...])
     def forward(self, x):
         x = F.relu(self.layer1(x))
         x = F.relu(self.layer2(x))
-        return self.layer3(x)
+        x = F.relu(self.layer3(x))
+        return self.layer4(x)
 
 # HYPERPARAMETERS
 # batch_size = number of transitions sampled from replay buffer
@@ -62,13 +78,15 @@ class DQN(nn.Module):
 # eps_decay = controls the rate at which epsilon will exponentially decay (inverse to rate of decay)
 # tau = update rate of network
 # lr = learning rate of AdamW optimizer
+# early_stopping_threshold = number of consecutive episodes where the model truncates before it is stopped training
 BATCH_SIZE = 128
-GAMMA = 0.99
+GAMMA = 0.8
 EPS_START = 0.9
 EPS_END = 0.05
 EPS_DECAY = 1000
 TAU = 0.005
 LR = 1e-4
+EARLY_STOPPING_THRESHOLD = 10
 
 # get number of actions from action space
 n_actions = env.action_space.n
@@ -176,6 +194,9 @@ if torch.cuda.is_available() or torch.backends.mps.is_available():
 else: 
     num_episodes = 600
 
+trunc_count = 0
+prev_trunc_ep = 0
+
 for i_episode in range(num_episodes):
     # Initialize env and get state
     state, info = env.reset()
@@ -215,8 +236,48 @@ for i_episode in range(num_episodes):
             episode_durations.append(t+1)
             plot_durations()
             break
+
+    if truncated: 
+            if trunc_count == 0 or i_episode - 1 == prev_trunc_ep:
+                trunc_count += 1
+                prev_trunc_ep = i_episode
+            else:
+                trunc_count = 1
+                prev_trunc_ep = i_episode
+    
+    if trunc_count > EARLY_STOPPING_THRESHOLD:
+        print('Early stopping threshold met...')
+        break
     
 print('Complete')
 plot_durations(show_result=True)
 plt.ioff()
 plt.show()
+
+sleep(5)
+
+def watch_trained_model(env, policy_net, num_episodes=5):
+    for i_episode in range(num_episodes):
+        state, _ = env.reset()
+        state = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
+        
+        for t in count():
+            env.render()  # Render the environment
+            
+            # Select the best action using the trained policy network (no exploration)
+            with torch.no_grad():
+                action = policy_net(state).max(1).indices.view(1, 1)
+            
+            # Take the action in the environment
+            observation, reward, terminated, truncated, _ = env.step(action.item())
+            state = torch.tensor(observation, dtype=torch.float32, device=device).unsqueeze(0)
+            
+            # If episode ends, break the loop
+            if terminated or truncated:
+                print(f"Episode {i_episode+1} finished after {t+1} timesteps")
+                break
+
+    env.close()  # Close the environment after running
+
+print("Training complete, now watching the trained model...")
+watch_trained_model(env, policy_net)
